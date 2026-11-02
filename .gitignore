@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Profiling
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+
+# Generated benchmark data
+*.tokens.csv
+benchmark_*.json
+project_benchmark_*.json
+
+# Model weights
+*.safetensors
+*.bin
+*.pt
+*.pth
+huggingface/
+checkpoints/
+
+
+Inner_README.md

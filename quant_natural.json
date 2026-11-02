@@ -1,0 +1,274 @@
+{
+  "fp16": [
+    {
+      "prompt": "The capital of France is",
+      "token_ids": [
+        12095,
+        13,
+        576,
+        6722,
+        315,
+        15344,
+        374,
+        21718,
+        13,
+        576,
+        6722,
+        315,
+        17689,
+        374,
+        24081,
+        13
+      ],
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid."
+    },
+    {
+      "prompt": "2 + 2 =",
+      "token_ids": [
+        220,
+        19,
+        11,
+        773,
+        279,
+        2629,
+        374,
+        220,
+        19,
+        382,
+        3983,
+        3783,
+        11,
+        279,
+        3491,
+        2727
+      ],
+      "text": " 4, so the sum is 4.\n\nBut wait, the problem says"
+    },
+    {
+      "prompt": "Once upon a time, there was a small",
+      "token_ids": [
+        6290,
+        304,
+        279,
+        6149,
+        315,
+        279,
+        220,
+        16,
+        24,
+        339,
+        9294,
+        11,
+        1380,
+        279,
+        1251,
+        12163
+      ],
+      "text": " town in the middle of the 19th century, where the people lived"
+    }
+  ],
+  "int8_weight": [
+    {
+      "prompt": "The capital of France is",
+      "token_ids": [
+        12095,
+        13,
+        576,
+        6722,
+        315,
+        15344,
+        374,
+        21718,
+        13,
+        576,
+        6722,
+        315,
+        17689,
+        374,
+        24081,
+        13
+      ],
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid."
+    },
+    {
+      "prompt": "2 + 2 =",
+      "token_ids": [
+        220,
+        19,
+        11,
+        773,
+        279,
+        2629,
+        374,
+        220,
+        19,
+        382,
+        3983,
+        3783,
+        11,
+        279,
+        3491,
+        2727
+      ],
+      "text": " 4, so the sum is 4.\n\nBut wait, the problem says"
+    },
+    {
+      "prompt": "Once upon a time, there was a small",
+      "token_ids": [
+        6290,
+        304,
+        279,
+        6149,
+        315,
+        279,
+        220,
+        16,
+        24,
+        339,
+        9294,
+        11,
+        1380,
+        279,
+        1251,
+        12163
+      ],
+      "text": " town in the middle of the 19th century, where the people lived"
+    }
+  ],
+  "w8a8": [
+    {
+      "prompt": "The capital of France is",
+      "token_ids": [
+        12095,
+        13,
+        576,
+        6722,
+        315,
+        15344,
+        374,
+        21718,
+        13,
+        576,
+        6722,
+        315,
+        17689,
+        374,
+        24081,
+        13
+      ],
+      "text": " Paris. The capital of Italy is Rome. The capital of Spain is Madrid."
+    },
+    {
+      "prompt": "2 + 2 =",
+      "token_ids": [
+        220,
+        19,
+        11,
+        220,
+        19,
+        488,
+        220,
+        17,
+        284,
+        220,
+        21,
+        11,
+        220,
+        21,
+        488,
+        220
+      ],
+      "text": " 4, 4 + 2 = 6, 6 + "
+    },
+    {
+      "prompt": "Once upon a time, there was a small",
+      "token_ids": [
+        6290,
+        304,
+        279,
+        6149,
+        315,
+        27112,
+        13,
+        576,
+        6290,
+        572,
+        3881,
+        369,
+        1181,
+        4911,
+        7674,
+        323
+      ],
+      "text": " town in the middle of nowhere. The town was known for its unique culture and"
+    }
+  ],
+  "fp8_dynamic": [
+    {
+      "prompt": "The capital of France is",
+      "token_ids": [
+        12095,
+        13,
+        576,
+        6722,
+        315,
+        9625,
+        374,
+        1083,
+        279,
+        6722,
+        315,
+        279,
+        8585,
+        5429,
+        13,
+        576
+      ],
+      "text": " Paris. The capital of France is also the capital of the French Republic. The"
+    },
+    {
+      "prompt": "2 + 2 =",
+      "token_ids": [
+        220,
+        19,
+        11,
+        220,
+        19,
+        488,
+        220,
+        17,
+        284,
+        220,
+        21,
+        11,
+        220,
+        21,
+        488,
+        220
+      ],
+      "text": " 4, 4 + 2 = 6, 6 + "
+    },
+    {
+      "prompt": "Once upon a time, there was a small",
+      "token_ids": [
+        6290,
+        304,
+        279,
+        6149,
+        315,
+        279,
+        220,
+        16,
+        24,
+        339,
+        9294,
+        11,
+        1380,
+        279,
+        1251,
+        12163
+      ],
+      "text": " town in the middle of the 19th century, where the people lived"
+    }
+  ]
+}
