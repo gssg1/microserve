@@ -7,6 +7,7 @@ from microserve.layers.fp8_chunk_prefill_attention import fp8_chunk_prefill_atte
 from microserve.layers.fp8_decode_attention import fp8_decode_attention
 from microserve.layers.fp8_kv_cache import store_fp8_kvcache
 from microserve.utils.context import AttentionMode, get_context
+from microserve.utils.profiling import profile_range
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor,
                   k_cache: torch.Tensor, v_cache: torch.Tensor,
@@ -21,8 +22,6 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor,
     v_cache.reshape(-1, D).index_copy_(0, sm, value)
 
 class Attention(nn.Module):
-    """paged attention。k_cache/v_cache 由 model_runner 注入（普通属性，不进 state_dict）。"""
-
     def __init__(self, num_heads: int, head_dim: int, scale: float, num_kv_heads: int):
         super().__init__()
         self.num_heads = num_heads
@@ -38,48 +37,59 @@ class Attention(nn.Module):
         k_cache, v_cache = self.k_cache, self.v_cache
         assert k_cache.numel(), "k_cache 未注入：model_runner 须先 allocate_kv_cache"
         if self.kv_cache_dtype == "fp8_e4m3":
-            store_fp8_kvcache(
-                k, v, k_cache, v_cache, self.k_scale_cache,
-                self.v_scale_cache, ctx.slot_mapping)
+            with profile_range("attention.kv_cache_store", detailed=True):
+                store_fp8_kvcache(
+                    k, v, k_cache, v_cache, self.k_scale_cache,
+                    self.v_scale_cache, ctx.slot_mapping)
             if ctx.mode is AttentionMode.DECODE:
-                return fp8_decode_attention(
-                    q, k_cache, v_cache, self.k_scale_cache,
-                    self.v_scale_cache, ctx.cache_seqlens,
-                    ctx.block_tables, self.scale)
+                with profile_range("attention.decode_kernel", detailed=True):
+                    return fp8_decode_attention(
+                        q, k_cache, v_cache, self.k_scale_cache,
+                        self.v_scale_cache, ctx.cache_seqlens,
+                        ctx.block_tables, self.scale)
             if ctx.mode is AttentionMode.PREFILL:
+                with profile_range("attention.prefill_kernel", detailed=True):
+                    return flash_attn_varlen_func(
+                        q, k, v, cu_seqlens_q=ctx.cu_seqlens_q,
+                        cu_seqlens_k=ctx.cu_seqlens_k,
+                        max_seqlen_q=ctx.max_seqlen_q,
+                        max_seqlen_k=ctx.max_seqlen_k,
+                        softmax_scale=self.scale, causal=True)
+            if ctx.mode is AttentionMode.CHUNK_PREFILL:
+                with profile_range(
+                        "attention.chunk_prefill_kernel", detailed=True):
+                    return fp8_chunk_prefill_attention(
+                        q, k_cache, v_cache, self.k_scale_cache,
+                        self.v_scale_cache, ctx.block_tables,
+                        ctx.prefix_len, self.scale)
+            raise RuntimeError(f"unsupported attention mode: {ctx.mode}")
+
+        with profile_range("attention.kv_cache_store", detailed=True):
+            store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
+        if ctx.mode is AttentionMode.DECODE:
+            with profile_range("attention.decode_kernel", detailed=True):
+                o = flash_attn_with_kvcache(
+                    q.unsqueeze(1), k_cache, v_cache,
+                    cache_seqlens=ctx.cache_seqlens, block_table=ctx.block_tables,
+                    softmax_scale=self.scale, causal=True)
+                return o.squeeze(1)
+        if ctx.mode is AttentionMode.PREFILL:
+            with profile_range("attention.prefill_kernel", detailed=True):
                 return flash_attn_varlen_func(
-                    q, k, v, cu_seqlens_q=ctx.cu_seqlens_q,
+                    q, k, v,
+                    cu_seqlens_q=ctx.cu_seqlens_q,
                     cu_seqlens_k=ctx.cu_seqlens_k,
                     max_seqlen_q=ctx.max_seqlen_q,
                     max_seqlen_k=ctx.max_seqlen_k,
                     softmax_scale=self.scale, causal=True)
-            if ctx.mode is AttentionMode.CHUNK_PREFILL:
-                return fp8_chunk_prefill_attention(
-                    q, k_cache, v_cache, self.k_scale_cache,
-                    self.v_scale_cache, ctx.block_tables,
-                    ctx.prefix_len, self.scale)
-            raise RuntimeError(f"unsupported attention mode: {ctx.mode}")
-
-        store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
-        if ctx.mode is AttentionMode.DECODE:
-            o = flash_attn_with_kvcache(
-                q.unsqueeze(1), k_cache, v_cache,
-                cache_seqlens=ctx.cache_seqlens, block_table=ctx.block_tables,
-                softmax_scale=self.scale, causal=True)
-            return o.squeeze(1)
-        if ctx.mode is AttentionMode.PREFILL:
-            return flash_attn_varlen_func(
-                q, k, v,
-                cu_seqlens_q=ctx.cu_seqlens_q,
-                cu_seqlens_k=ctx.cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q,
-                max_seqlen_k=ctx.max_seqlen_k,
-                softmax_scale=self.scale, causal=True)
         if ctx.mode is AttentionMode.CHUNK_PREFILL:
-            o = flash_attn_varlen_func(
-                q, k_cache, v_cache,
-                cu_seqlens_q=ctx.cu_seqlens_q, cu_seqlens_k=ctx.cu_seqlens_k,
-                max_seqlen_q=ctx.max_seqlen_q, max_seqlen_k=ctx.max_seqlen_k,
-                softmax_scale=self.scale, causal=True, block_table=ctx.block_tables)
-            return o
+            with profile_range("attention.chunk_prefill_kernel", detailed=True):
+                return flash_attn_varlen_func(
+                    q, k_cache, v_cache,
+                    cu_seqlens_q=ctx.cu_seqlens_q,
+                    cu_seqlens_k=ctx.cu_seqlens_k,
+                    max_seqlen_q=ctx.max_seqlen_q,
+                    max_seqlen_k=ctx.max_seqlen_k,
+                    softmax_scale=self.scale, causal=True,
+                    block_table=ctx.block_tables)
         raise RuntimeError(f"unsupported attention mode: {ctx.mode}")

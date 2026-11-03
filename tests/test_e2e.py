@@ -14,7 +14,6 @@ MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B")
 MAX_NEW = 12
 
 def run_prompts(prompts, chunk_budget):
-    """对每个 prompt：microserve greedy 与 HF greedy 逐 token 对比。"""
     tok = AutoTokenizer.from_pretrained(MODEL)
     config = Config(model_dir=MODEL, enforce_eager=True,
                     max_num_seqs=4, max_num_batched_tokens=chunk_budget)

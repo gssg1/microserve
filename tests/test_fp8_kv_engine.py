@@ -1,5 +1,3 @@
-"""End-to-end FP8 KV mixed-batch and CUDA-graph regression."""
-
 import os
 
 from microserve.Config import Config

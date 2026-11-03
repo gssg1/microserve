@@ -1,8 +1,7 @@
-"""Project-level ablations for scheduling, CUDA Graph, fusion and quantization."""
-
 import argparse
 import gc
 import json
+import os
 import random
 import statistics
 import time
@@ -12,6 +11,7 @@ import torch
 import triton
 
 from microserve.Config import Config
+from microserve.distributed import destroy_distributed, is_rank_zero
 from microserve.engine.llm import LLMEngine
 from microserve.engine.sequence import SamplingParams
 from microserve.layers.layernorm import RMSNorm
@@ -149,6 +149,7 @@ def make_engine(args, *, policy="mixed", eager=False, fused=True,
         quantization=quantization,
         eos_token_id=None,
         seed=0,
+        tensor_parallel_size=args.tensor_parallel_size,
     ))
 
 
@@ -241,6 +242,8 @@ def summarize_suite(raw):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="~/huggingface/Qwen3-0.6B")
+    parser.add_argument("--tensor-parallel-size", type=int,
+                        default=int(os.environ.get("WORLD_SIZE", 1)))
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", default="project_benchmark.json")
     parser.add_argument(
@@ -312,10 +315,11 @@ def main():
                 for i in range(args.repeats)]
             raw["kv_cache_storage_bytes"] = {
                 "fp8_e4m3": kv_cache_storage_bytes(engine)}
-        output = Path(args.output)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-        print("saved", output)
+        if is_rank_zero():
+            output = Path(args.output)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            print("saved", output)
         return
 
     raw["rmsnorm_microbenchmark_ms"] = microbenchmark_rmsnorm()
@@ -392,12 +396,16 @@ def main():
     torch.cuda.empty_cache()
 
     raw["summary"] = summarize_suite(raw)
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(raw, indent=2), encoding="utf-8")
-    print(json.dumps(raw["summary"], indent=2))
-    print("saved", output)
+    if is_rank_zero():
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+        print(json.dumps(raw["summary"], indent=2))
+        print("saved", output)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        destroy_distributed()

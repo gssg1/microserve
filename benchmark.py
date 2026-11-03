@@ -1,19 +1,22 @@
-"""Reproducible FP16 / FP8 workload and latency records."""
-
 import argparse
 import csv
 import gc
 import json
+import os
 import random
 import statistics
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 
 from microserve.Config import Config
+from microserve.distributed import (destroy_distributed, get_global_rank,
+                                    is_rank_zero)
 from microserve.engine.llm import LLMEngine
 from microserve.engine.sequence import SamplingParams
+from microserve.utils.environment import environment_info, gpu_state
 
 
 def percentile(values, pct):
@@ -51,12 +54,15 @@ def run(args, quantization, prompts):
                     max_model_len=args.max_model_len,
                     enforce_eager=args.eager,
                     fused_rmsnorm=not args.no_fused_rmsnorm,
-                    eos_token_id=None, seed=args.seed)
+                    eos_token_id=None, seed=args.seed,
+                    tensor_parallel_size=args.tensor_parallel_size,
+                    enable_metrics=args.profile != "none",
+                    enable_nvtx=args.profile in ("nvtx", "torch"),
+                    profile_layers=args.profile_layers,
+                    profile_cuda_events=args.profile == "events")
     engine = LLMEngine(config)
     assert all(max(p) < engine.runner.vocab_size for p in prompts)
 
-    # Warm the same prefill/decode batch shapes before timing. Triton kernels
-    # compile for shape M, so a single-request warmup would bias results.
     warm = [engine.add(ids, SamplingParams(temperature=0.0),
                        max_tokens=args.output_len) for ids in prompts]
     while not engine.is_idle():
@@ -64,6 +70,7 @@ def run(args, quantization, prompts):
     assert all(s.num_completion_tokens == args.output_len for s in warm)
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
+    engine.reset_metrics()
 
     seqs = [engine.add(ids, SamplingParams(temperature=0.0),
                        max_tokens=args.output_len) for ids in prompts]
@@ -71,22 +78,47 @@ def run(args, quantization, prompts):
     peak_running_seqs = len(engine.scheduler.running)
     batch_counts = {"prefill_only": 0, "decode_only": 0, "mixed": 0}
     scheduled_prefill_tokens = scheduled_decode_tokens = 0
+    gpu_state_before = gpu_state()
+    profiler_context = nullcontext(None)
+    if args.profile == "torch":
+        mode = quantization or "fp16"
+        trace_dir = Path(args.trace_dir) / mode
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        profiler_context = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1, warmup=1, active=args.profile_steps, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                str(trace_dir),
+                worker_name=f"rank_{get_global_rank()}"),
+            record_shapes=True,
+        )
     torch.cuda.nvtx.range_push("microserve_measured_" + (quantization or "fp16"))
     started = time.perf_counter()
-    while not engine.is_idle():
-        engine.step()
-        stats = engine.scheduler.last_batch_stats
-        if stats is not None:
-            kind = ("mixed" if stats["prefill"] and stats["decode"] else
-                    "prefill_only" if stats["prefill"] else "decode_only")
-            batch_counts[kind] += 1
-            scheduled_prefill_tokens += stats["prefill_tokens"]
-            scheduled_decode_tokens += stats["decode_tokens"]
-        peak_waiting_requests = max(peak_waiting_requests, len(engine.scheduler.waiting))
-        peak_running_seqs = max(peak_running_seqs, len(engine.scheduler.running))
+    with profiler_context as profiler:
+        while not engine.is_idle():
+            engine.step()
+            if profiler is not None:
+                profiler.step()
+            stats = engine.scheduler.last_batch_stats
+            if stats is not None:
+                kind = ("mixed" if stats["prefill"] and stats["decode"] else
+                        "prefill_only" if stats["prefill"] else "decode_only")
+                batch_counts[kind] += 1
+                scheduled_prefill_tokens += stats["prefill_tokens"]
+                scheduled_decode_tokens += stats["decode_tokens"]
+            peak_waiting_requests = max(
+                peak_waiting_requests, len(engine.scheduler.waiting))
+            peak_running_seqs = max(
+                peak_running_seqs, len(engine.scheduler.running))
     torch.cuda.synchronize()
     ended = time.perf_counter()
     torch.cuda.nvtx.range_pop()
+    gpu_state_after = gpu_state()
+    profiling = engine.metrics_snapshot(gather=True)
 
     rows = []
     for seq in seqs:
@@ -102,14 +134,27 @@ def run(args, quantization, prompts):
             "output_tokens": seq.num_completion_tokens,
             "completion_token_ids": seq.completion_token_ids,
             "preemption_count": seq.preemption_count,
+            "prefill_started_at": seq.prefill_started_at,
+            "prefill_finished_at": seq.prefill_finished_at,
+            "scheduler_steps": seq.num_scheduler_steps,
+            "prefill_steps": seq.num_prefill_steps,
+            "decode_steps": seq.num_decode_steps,
             "ttft_ms": (stamps[0] - seq.arrived_at) * 1000 if stamps else None,
             "queue_ms": (seq.first_scheduled_at - seq.arrived_at) * 1000,
+            "prefill_ms": (
+                (seq.prefill_finished_at - seq.prefill_started_at) * 1000
+                if (seq.prefill_started_at is not None
+                    and seq.prefill_finished_at is not None) else None),
+            "tpot_ms": (
+                (stamps[-1] - stamps[0]) * 1000 / (len(stamps) - 1)
+                if len(stamps) > 1 else None),
             "latency_ms": (seq.finished_at - seq.arrived_at) * 1000,
             "token_intervals_ms": [(b - a) * 1000 for a, b in zip(stamps, stamps[1:])],
         })
     ttfts = [r["ttft_ms"] for r in rows if r["ttft_ms"] is not None]
     intervals = [x for r in rows for x in r["token_intervals_ms"]]
     elapsed = ended - started
+    input_tokens = sum(r["prompt_tokens"] for r in rows)
     output_tokens = sum(r["output_tokens"] for r in rows)
     result = {
         "config": {"model": args.model, "quantization": quantization or "fp16",
@@ -121,10 +166,18 @@ def run(args, quantization, prompts):
                    "scheduler_policy": args.scheduler_policy,
                    "max_num_batched_tokens": args.max_num_batched_tokens,
                    "num_kvcache_blocks": engine.runner.num_blocks,
-                   "eager": args.eager},
+                   "tensor_parallel_size": args.tensor_parallel_size,
+                   "eager": engine.runner.enforce_eager,
+                   "profile": args.profile,
+                   "profile_layers": args.profile_layers},
         "features": {"fused_rmsnorm": not args.no_fused_rmsnorm},
+        "environment": environment_info(),
+        "gpu_state_before": gpu_state_before,
+        "gpu_state_after": gpu_state_after,
         "metrics": {"elapsed_s": elapsed, "requests_per_s": len(rows) / elapsed,
+                    "input_tokens_per_s": input_tokens / elapsed,
                     "output_tokens_per_s": output_tokens / elapsed,
+                    "total_tokens_per_s": (input_tokens + output_tokens) / elapsed,
                     "peak_waiting_requests": peak_waiting_requests,
                     "peak_running_seqs": peak_running_seqs,
                     "batch_counts": batch_counts,
@@ -132,6 +185,12 @@ def run(args, quantization, prompts):
                     "scheduled_decode_tokens": scheduled_decode_tokens,
                     "ttft_ms": summary(ttfts),
                     "queue_ms": summary([r["queue_ms"] for r in rows]),
+                    "prefill_ms": summary([
+                        r["prefill_ms"] for r in rows
+                        if r["prefill_ms"] is not None]),
+                    "tpot_ms": summary([
+                        r["tpot_ms"] for r in rows
+                        if r["tpot_ms"] is not None]),
                     "token_interval_ms": summary(intervals),
                     "latency_ms": summary([r["latency_ms"] for r in rows]),
                     "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(),
@@ -143,6 +202,7 @@ def run(args, quantization, prompts):
                            if engine.runner.kv_scale_cache is not None else 0)),
                     "quantized_linear_count": engine.runner.num_quantized_linears},
         "requests": rows,
+        "profiling": profiling,
     }
     del engine, warm, seqs
     gc.collect()
@@ -154,6 +214,8 @@ def run(args, quantization, prompts):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="~/huggingface/Qwen3-0.6B")
+    parser.add_argument("--tensor-parallel-size", type=int,
+                        default=int(os.environ.get("WORLD_SIZE", 1)))
     parser.add_argument("--output", default="benchmark_results.json")
     parser.add_argument("--requests", type=int, default=16)
     parser.add_argument("--input-len", type=int, default=64)
@@ -177,6 +239,12 @@ def main():
                         help="Run selected modes in reverse order to check order bias")
     parser.add_argument("--mode", choices=["both", "fp16", "fp8_dynamic"],
                         default="both")
+    parser.add_argument(
+        "--profile", choices=["none", "steps", "events", "nvtx", "torch"],
+        default="none")
+    parser.add_argument("--profile-layers", action="store_true")
+    parser.add_argument("--profile-steps", type=int, default=4)
+    parser.add_argument("--trace-dir", default="traces")
     args = parser.parse_args()
     args.model = str(Path(args.model).expanduser())
     if args.input_len_min is None:
@@ -209,6 +277,8 @@ def main():
                     results[mode]["metrics"]["output_tokens_per_s"] /
                     results["fp16"]["metrics"]["output_tokens_per_s"]),
             }
+    if not is_rank_zero():
+        return
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=2), encoding="utf-8")
@@ -232,4 +302,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        destroy_distributed()

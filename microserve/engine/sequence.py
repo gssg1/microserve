@@ -11,7 +11,6 @@ class SequenceStatus(Enum):
 
 @dataclass
 class SamplingParams:
-    """采样参数；由 model_runner 侧的 sampler 读取。"""
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
@@ -29,9 +28,14 @@ class Sequence:
         self.waiting_entered_at: float | None = None
         self.arrived_at: float | None = None
         self.first_scheduled_at: float | None = None
+        self.prefill_started_at: float | None = None
+        self.prefill_finished_at: float | None = None
         self.finished_at: float | None = None
         self.token_timestamps: list[float] = []
         self.preemption_count = 0
+        self.num_scheduler_steps = 0
+        self.num_prefill_steps = 0
+        self.num_decode_steps = 0
         self.token_ids = copy(token_ids)
         self.num_prompt_tokens = len(token_ids)
 
@@ -55,16 +59,13 @@ class Sequence:
 
     @property
     def num_completion_tokens(self) -> int:
-        """已生成的 token 数（不含 prompt）。"""
         return self.num_tokens_with_spec - self.num_prompt_tokens
 
     @property
     def completion_token_ids(self) -> list[int]:
-        """已生成的 token id（不含 prompt）。"""
         return self.token_ids[self.num_prompt_tokens:]
 
     def append_token(self, token_id: int):
-        """decode 采样得到新 token 后追加；num_tokens_with_spec 同步 +1，gap 回到 1。"""
         self.token_ids.append(token_id)
         self.num_tokens_with_spec += 1
 

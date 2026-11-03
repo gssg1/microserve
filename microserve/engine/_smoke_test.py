@@ -12,8 +12,6 @@ def make_scheduler(num_blocks, max_batched, max_num_seqs=8, eos=None):
                      eos_token_id=eos)
 
 class FakeRunner:
-    """模拟 model_runner.execute：返回递增 token（不命中 eos），校验执行区间。"""
-
     def __init__(self):
         self.tokens = itertools.count(20000)
         self.total_tokens_executed = 0
@@ -32,7 +30,6 @@ class FakeRunner:
         return outputs
 
 def drive(scheduler, runner, until=None, verbose=False):
-    """驱动循环，跑满 until 轮（None=直到空闲）；返回 (轮数, 各轮 batch 快照)。"""
     rounds = []
     while not scheduler.is_idle() and (until is None or len(rounds) < until):
         batch = scheduler.schedule()

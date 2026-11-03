@@ -1,5 +1,3 @@
-"""FP8 E4M3 paged KV-cache quantization and scatter."""
-
 import torch
 import triton
 import triton.language as tl

@@ -4,6 +4,9 @@ import torch
 from transformers import AutoConfig
 
 from microserve.Config import Config
+from microserve.distributed import (broadcast_tensor, gather_tensor, get_device,
+                                    get_tensor_model_parallel_world_size,
+                                    is_rank_zero, tensor_model_parallel_min)
 from microserve.engine.sequence import Sequence
 from microserve.layers.attention import Attention
 from microserve.layers.fp8_linear import quantize_fp8_linears
@@ -11,9 +14,10 @@ from microserve.models.qwen3 import Qwen3ForCausalLM
 from microserve.utils.context import (AttentionMode, Context, get_context,
                                       reset_context, set_context)
 from microserve.utils.loader import load_model
+from microserve.utils.profiling import (add_metric_value, cpu_profile,
+                                        profile_range)
 
 def _sample(logits: torch.Tensor, seq: Sequence) -> int:
-    """对单个 logits 行按 seq.sampling_params 采样（GPU 上执行）。"""
     p = seq.sampling_params
     logits = logits.float()
     if p.temperature is not None and p.temperature > 0:
@@ -38,13 +42,22 @@ class ModelRunner:
         self.config = config
         self.block_size = config.block_size
         self.num_blocks = config.num_kvcache_blocks
-        self.enforce_eager = config.enforce_eager
-        self.device = torch.device("cuda")
+        self.tp_size = get_tensor_model_parallel_world_size()
+        if config.tensor_parallel_size != self.tp_size:
+            raise ValueError(
+                f"tensor_parallel_size={config.tensor_parallel_size}, "
+                f"WORLD_SIZE={self.tp_size}")
+        self.enforce_eager = config.enforce_eager or self.tp_size > 1
+        self.device = get_device()
 
         self.hf_config = AutoConfig.from_pretrained(config.model_dir,
                                                     trust_remote_code=True)
         dtype = config.dtype
-        self.num_kv_heads = self.hf_config.num_key_value_heads
+        assert self.hf_config.num_attention_heads % self.tp_size == 0
+        assert self.hf_config.num_key_value_heads % self.tp_size == 0
+        assert self.hf_config.intermediate_size % self.tp_size == 0
+        assert self.hf_config.vocab_size % self.tp_size == 0
+        self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
         self.head_dim = getattr(self.hf_config, "head_dim", None) or (
             self.hf_config.hidden_size // self.hf_config.num_attention_heads)
         self.num_layers = self.hf_config.num_hidden_layers
@@ -68,7 +81,9 @@ class ModelRunner:
             self.num_quantized_linears = quantize_fp8_linears(self.model)
 
         if self.num_blocks <= 0:
-            self.num_blocks = self._auto_num_blocks()
+            self.num_blocks = tensor_model_parallel_min(self._auto_num_blocks())
+        else:
+            self.num_blocks = tensor_model_parallel_min(self.num_blocks)
 
         self.garbage_slot = self.num_blocks * self.block_size
         cache_dtype = (torch.float8_e4m3fn
@@ -217,39 +232,67 @@ class ModelRunner:
 
     @torch.inference_mode()
     def execute(self, seqs: list[Sequence]) -> list[int | None]:
-        decode, prefill, chunk = self._partition_batch(seqs)
+        with cpu_profile("runner.partition_batch"):
+            decode, prefill, chunk = self._partition_batch(seqs)
+        add_metric_value(
+            "first_prefill_tokens",
+            sum(seq.num_scheduled_tokens for _, seq in prefill),
+        )
+        add_metric_value(
+            "chunk_prefill_tokens",
+            sum(seq.num_scheduled_tokens for _, seq in chunk),
+        )
         outputs: list[int | None] = [None] * len(seqs)
         try:
             if decode:
                 indices, group = zip(*decode)
                 group = list(group)
-                ctx, input_ids, positions = self._compile_decode(group)
+                with cpu_profile("decode.compile"):
+                    ctx, input_ids, positions = self._compile_decode(group)
                 set_context(ctx)
-                hidden = self._run_decode(input_ids, positions)
-                logits = self.model.compute_logits(hidden)
-                sampled = self._sample_rows(group, logits, list(range(len(group))))
+                with profile_range("decode.model", measure_cuda=True):
+                    hidden = self._run_decode(input_ids, positions)
+                with profile_range("decode.lm_head", measure_cuda=True):
+                    local_logits = self.model.compute_logits(hidden)
+                with profile_range("decode.logits_all_gather", measure_cuda=True):
+                    logits = self._gather_logits(local_logits)
+                sampled = self._sample_rows(
+                    group, logits, list(range(len(group))), "decode")
                 for index, token in zip(indices, sampled):
                     outputs[index] = token
 
             if prefill:
                 indices, group = zip(*prefill)
                 group = list(group)
-                ctx, cu_q, input_ids, positions = self._compile_prefill(group)
+                with cpu_profile("prefill.compile"):
+                    ctx, cu_q, input_ids, positions = self._compile_prefill(group)
                 set_context(ctx)
-                hidden = self.model(input_ids, positions)
+                with profile_range("prefill.model", measure_cuda=True):
+                    hidden = self.model(input_ids, positions)
                 last_idx = (cu_q[1:] - 1)
                 hidden = hidden[last_idx]
-                logits = self.model.compute_logits(hidden)
-                sampled = self._sample_rows(group, logits, list(range(len(group))))
+                with profile_range("prefill.lm_head", measure_cuda=True):
+                    local_logits = self.model.compute_logits(hidden)
+                with profile_range("prefill.logits_all_gather", measure_cuda=True):
+                    logits = self._gather_logits(local_logits)
+                sampled = self._sample_rows(
+                    group, logits, list(range(len(group))), "prefill")
                 for index, token in zip(indices, sampled):
                     outputs[index] = token
 
             for index, seq in chunk:
-                ctx, input_ids, positions = self._compile_chunk_prefill(seq)
+                with cpu_profile("chunk_prefill.compile"):
+                    ctx, input_ids, positions = self._compile_chunk_prefill(seq)
                 set_context(ctx)
-                hidden = self.model(input_ids, positions)
-                logits = self.model.compute_logits(hidden[-1:])
-                outputs[index] = self._sample_rows([seq], logits, [0])[0]
+                with profile_range("chunk_prefill.model", measure_cuda=True):
+                    hidden = self.model(input_ids, positions)
+                with profile_range("chunk_prefill.lm_head", measure_cuda=True):
+                    local_logits = self.model.compute_logits(hidden[-1:])
+                with profile_range(
+                        "chunk_prefill.logits_all_gather", measure_cuda=True):
+                    logits = self._gather_logits(local_logits)
+                outputs[index] = self._sample_rows(
+                    [seq], logits, [0], "chunk_prefill")[0]
         finally:
             reset_context()
         return outputs
@@ -281,14 +324,24 @@ class ModelRunner:
         return self.model(input_ids, positions)
 
     def _sample_rows(self, seqs: list[Sequence], logits: torch.Tensor,
-                     rows: list[int]) -> list[int | None]:
+                     rows: list[int], mode: str) -> list[int | None]:
         out: list[int | None] = []
         for i, seq in enumerate(seqs):
             if not seq.needs_sample:
                 out.append(None)
             else:
-                out.append(_sample(logits[i], seq))
+                token = torch.empty(1, dtype=torch.int64, device=self.device)
+                if is_rank_zero():
+                    with profile_range(f"{mode}.sample", measure_cuda=True):
+                        token[0] = _sample(logits[i], seq)
+                with profile_range(
+                        f"{mode}.token_broadcast", measure_cuda=True):
+                    broadcast_tensor(token)
+                out.append(int(token.item()))
         return out
+
+    def _gather_logits(self, local_logits: torch.Tensor) -> torch.Tensor:
+        return gather_tensor(local_logits, dim=-1)
 
     def _warmup(self):
         ctx = Context(

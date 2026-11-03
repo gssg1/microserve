@@ -1,5 +1,3 @@
-"""Numerical checks for FP8 paged KV store, decode and chunk prefill."""
-
 import torch
 
 from microserve.layers.fp8_chunk_prefill_attention import (

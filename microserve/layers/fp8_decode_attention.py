@@ -1,5 +1,3 @@
-"""Decode attention over a paged FP8 E4M3 KV cache."""
-
 import torch
 import triton
 import triton.language as tl
@@ -73,8 +71,6 @@ def fp8_decode_attention(
     block_size = k_cache.shape[1]
     max_num_blocks = block_tables.shape[1]
     if block_n is None:
-        # RTX 5060 Laptop sweep: larger KV tiles win until the grid is large
-        # enough that their register pressure starts to reduce occupancy.
         if batch_size >= 64:
             block_n = 64
         elif batch_size >= 32 and max_num_blocks >= 4:
@@ -88,7 +84,6 @@ def fp8_decode_attention(
     assert block_tables.dtype == torch.int32
     assert num_q_heads % num_kv_heads == 0
     assert head_dim == k_cache.shape[3]
-    # A tile must stay inside one physical page: BLOCK_N | block_size.
     assert block_size % block_n == 0
     output = torch.empty_like(query)
     _fp8_decode_flashAttention[(batch_size, num_q_heads)](

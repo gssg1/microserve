@@ -28,6 +28,9 @@ class BlockManager:
         self.hash_to_block: dict[int,int] = dict()
         self.free_blocks: deque[int] = deque(range(nums_block))
         self.used_blocks: set[int] = set()
+        self.total_blocks_allocated = 0
+        self.total_blocks_freed = 0
+        self.total_prefix_cache_hit_tokens = 0
 
     @property
     def free_blocks_nums(self) -> int:
@@ -49,6 +52,7 @@ class BlockManager:
             del self.hash_to_block[block.hash]
         block.reset()
         self.used_blocks.add(block_id)
+        self.total_blocks_allocated += 1
         return block_id
 
     def deallocate_block(self,block_id: int):
@@ -56,6 +60,7 @@ class BlockManager:
         assert block.ref_count == 0
         self.used_blocks.remove(block_id)
         self.free_blocks.append(block_id)
+        self.total_blocks_freed += 1
 
     def allocate_cache(self,seq: Sequence) -> list[int]:
         nums_block = seq.num_tokens_with_spec // self.block_size
@@ -69,6 +74,7 @@ class BlockManager:
                     seq.token_ids[i*self.block_size:(i+1)*self.block_size]):
                 block_table.append(block_id)
                 self.blocks[block_id].ref_count += 1
+                self.total_prefix_cache_hit_tokens += self.block_size
             else:
                 break
         return block_table
@@ -98,6 +104,7 @@ class BlockManager:
 
                 num_scheduled_tokens = min(self.free_blocks_nums * self.block_size,token_budget,seq.gap)
                 if (num_scheduled_tokens == 0 and seq.gap > 0):
+                    self.total_prefix_cache_hit_tokens -= len(block_table) * self.block_size
                     for block_id in block_table:
                         self.blocks[block_id].ref_count -= 1
                         if self.blocks[block_id].ref_count == 0:

@@ -76,13 +76,12 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
             seq.needs_sample = (
                 seq.num_computed_tokens + seq.num_scheduled_tokens == seq.num_tokens_with_spec)
+            if seq.gap > 1 and seq.prefill_started_at is None:
+                seq.prefill_started_at = perf_counter()
             budget -= seq.num_scheduled_tokens
             scheduled.append(seq)
 
         if self.policy == "prefill_first" and not scheduled:
-            # Homogeneous, prefill-priority ablation inspired by nano-vLLM's
-            # separate prefill/decode batches. It uses this engine's same KV
-            # manager and runner, so the scheduler policy is the only change.
             budget = self.max_num_batched_tokens
             for seq in [s for s in self.running if s.gap == 1]:
                 if budget <= 0:
@@ -123,12 +122,13 @@ class Scheduler:
 
         if is_decode:
             seq.num_scheduled_tokens = 1
+        elif seq.prefill_started_at is None:
+            seq.prefill_started_at = perf_counter()
         seq.needs_sample = (
             seq.num_computed_tokens + seq.num_scheduled_tokens == seq.num_tokens_with_spec)
         return True
 
     def _running_snapshot(self, decode_first: bool = True) -> list[Sequence]:
-        """running 的稳定快照；decode(gap==1) 排前以保证其低延迟优先。"""
         seqs = list(self.running)
         if decode_first:
             seqs.sort(key=lambda s: 0 if s.gap == 1 else 1)
@@ -155,10 +155,20 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], output_token_ids: list[int | None]):
         for seq, token_id in zip(seqs, output_token_ids):
+            was_decode = seq.gap == 1
+            seq.num_scheduler_steps += 1
+            if was_decode:
+                seq.num_decode_steps += 1
+            else:
+                seq.num_prefill_steps += 1
             self.block_manager.hash_blocks(seq)
 
             seq.num_computed_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
+
+            if (seq.prefill_finished_at is None
+                    and seq.num_computed_tokens >= seq.num_prompt_tokens):
+                seq.prefill_finished_at = perf_counter()
 
             if seq.num_computed_tokens < seq.num_tokens_with_spec:
                 seq.needs_sample = False

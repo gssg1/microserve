@@ -1,5 +1,3 @@
-"""Single-sequence causal chunk-prefill attention over paged FP8 KV."""
-
 import torch
 import triton
 import triton.language as tl
@@ -78,8 +76,6 @@ def fp8_chunk_prefill_attention(
     query_len, num_q_heads, head_dim = query.shape
     num_kv_heads = k_cache.shape[2]
     block_size = k_cache.shape[1]
-    # Shape sweep on RTX 5060 Laptop. BLOCK_M=64 usually loses occupancy;
-    # short Q benefits from a wider KV tile, while Q=128 prefers 32.
     if block_m is None:
         block_m = 16 if query_len <= 32 else 32
     if block_n is None:
@@ -96,7 +92,6 @@ def fp8_chunk_prefill_attention(
     assert k_scale_cache.dtype == v_scale_cache.dtype == torch.float32
     assert num_q_heads % num_kv_heads == 0
     assert head_dim == k_cache.shape[3]
-    # A tile must stay inside one physical page: BLOCK_N | block_size.
     assert block_size % block_n == 0
     output = torch.empty_like(query)
     grid = (triton.cdiv(query_len, block_m), num_q_heads)

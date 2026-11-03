@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from transformers import Qwen3Config
 
+from microserve.distributed import get_tensor_model_parallel_world_size
 from microserve.layers.activation import SiluAndMul
 from microserve.layers.attention import Attention
 from microserve.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
@@ -9,6 +10,7 @@ from microserve.layers.layernorm import RMSNorm
 from microserve.layers.linear import (MergedColumnParallelLinear,
                                       QKVParallelLinear, RowParallelLinear)
 from microserve.layers.rotary_embedding import get_rope
+from microserve.utils.profiling import profile_range
 
 class Qwen3Attention(nn.Module):
     def __init__(self, hidden_size: int, num_heads: int, num_kv_heads: int,
@@ -17,17 +19,21 @@ class Qwen3Attention(nn.Module):
                  rope_theta: float = 1000000.0,
                  fused_rmsnorm: bool = True) -> None:
         super().__init__()
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0
+        assert num_kv_heads % tp_size == 0
+        self.total_num_heads = num_heads
+        self.num_heads = num_heads // tp_size
+        self.num_kv_heads = num_kv_heads // tp_size
         self.head_dim = head_dim or hidden_size // num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim ** -0.5
 
         self.qkv_proj = QKVParallelLinear(hidden_size, self.head_dim,
-                                          self.num_heads, self.num_kv_heads,
+                                          num_heads, num_kv_heads,
                                           bias=qkv_bias)
-        self.o_proj = RowParallelLinear(self.num_heads * self.head_dim,
+        self.o_proj = RowParallelLinear(self.total_num_heads * self.head_dim,
                                         hidden_size, bias=False)
         self.rotary_emb = get_rope(self.head_dim, self.head_dim,
                                    max_position, rope_theta)
@@ -41,17 +47,22 @@ class Qwen3Attention(nn.Module):
 
     def forward(self, positions: torch.Tensor,
                 hidden_states: torch.Tensor) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
+        with profile_range("attention.qkv_proj", detailed=True):
+            qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         if not self.qkv_proj.bias:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        return self.o_proj(o.reshape(-1, self.num_heads * self.head_dim))
+            with profile_range("attention.qk_norm", detailed=True):
+                q = self.q_norm(q)
+                k = self.k_norm(k)
+        with profile_range("attention.rope", detailed=True):
+            q, k = self.rotary_emb(positions, q, k)
+        with profile_range("attention.kernel", detailed=True):
+            o = self.attn(q, k, v)
+        with profile_range("attention.o_proj", detailed=True):
+            return self.o_proj(o.reshape(-1, self.num_heads * self.head_dim))
 
 class Qwen3MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, hidden_act: str) -> None:
@@ -63,7 +74,12 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_up_proj(x)))
+        with profile_range("mlp.gate_up_proj", detailed=True):
+            gate_up = self.gate_up_proj(x)
+        with profile_range("mlp.silu", detailed=True):
+            hidden = self.act_fn(gate_up)
+        with profile_range("mlp.down_proj", detailed=True):
+            return self.down_proj(hidden)
 
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config) -> None:
@@ -90,13 +106,18 @@ class Qwen3DecoderLayer(nn.Module):
 
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor,
                 residual: torch.Tensor | None) -> tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
-        hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        with profile_range("layer.input_norm", detailed=True):
+            if residual is None:
+                hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        with profile_range("layer.attention", detailed=True):
+            hidden_states = self.self_attn(positions, hidden_states)
+        with profile_range("layer.post_attention_norm", detailed=True):
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+        with profile_range("layer.mlp", detailed=True):
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 class Qwen3Model(nn.Module):
@@ -109,15 +130,17 @@ class Qwen3Model(nn.Module):
 
     def forward(self, input_ids: torch.Tensor,
                 positions: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        with profile_range("model.embedding", detailed=True):
+            hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, residual)
-        return self.norm(hidden_states, residual)[0]
+        for index, layer in enumerate(self.layers):
+            with profile_range(f"model.layer_{index:02d}", detailed=True):
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual)
+        with profile_range("model.final_norm", detailed=True):
+            return self.norm(hidden_states, residual)[0]
 
 class Qwen3ForCausalLM(nn.Module):
-    """HF 权重名 -> 打包参数名 的映射（utils/loader.py 使用）。"""
-
     packed_modules_mapping = {
         "q_proj": ("qkv_proj", "q"),
         "k_proj": ("qkv_proj", "k"),
@@ -141,4 +164,5 @@ class Qwen3ForCausalLM(nn.Module):
         return self.model(input_ids, positions)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.lm_head(hidden_states)
+        with profile_range("model.lm_head", detailed=True):
+            return self.lm_head(hidden_states)

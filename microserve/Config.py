@@ -21,6 +21,11 @@ class Config:
     quantization: str | None = None
     kv_cache_dtype: str = "fp16"
     scheduler_policy: str = "mixed"
+    tensor_parallel_size: int = 1
+    enable_metrics: bool = False
+    enable_nvtx: bool = False
+    profile_layers: bool = False
+    profile_cuda_events: bool = False
 
     def __post_init__(self):
         import os
@@ -36,3 +41,4 @@ class Config:
             assert self.dtype == torch.float16, "FP8 KV cache currently requires FP16 model dtype"
         assert self.scheduler_policy in ("mixed", "prefill_first"), \
             "unsupported scheduler policy"
+        assert self.tensor_parallel_size > 0

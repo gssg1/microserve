@@ -2,7 +2,6 @@ import torch
 from torch import nn
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """transformers 同款：x = [x1, x2] -> [-x2, x1]。"""
     x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
@@ -34,7 +33,6 @@ _ROPE_CACHE: dict = {}
 
 def get_rope(head_size: int, rotary_dim: int, max_position: int,
              base: float) -> RotaryEmbedding:
-    """每 (head_size, base) 只建一次（cos/sin 表占内存）。"""
     key = (head_size, rotary_dim, max_position, base)
     if key not in _ROPE_CACHE:
         _ROPE_CACHE[key] = RotaryEmbedding(head_size, rotary_dim, max_position, base)

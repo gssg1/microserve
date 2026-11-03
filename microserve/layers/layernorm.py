@@ -30,8 +30,6 @@ def _residual_rmsnorm_kernel(x_ptr, residual_ptr, weight_ptr, out_ptr,
     x = tl.load(x_ptr + base, mask=mask, other=0.0).to(tl.float32)
     residual = tl.load(residual_ptr + base, mask=mask,
                        other=0.0).to(tl.float32)
-    # Match the reference path: add in FP32, round the residual stream to the
-    # model dtype, then compute RMSNorm from that rounded value.
     summed = (x + residual).to(tl.float16)
     summed_fp32 = summed.to(tl.float32)
     variance = tl.sum(summed_fp32 * summed_fp32, axis=0) / n_cols
@@ -43,8 +41,6 @@ def _residual_rmsnorm_kernel(x_ptr, residual_ptr, weight_ptr, out_ptr,
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with an optional Triton residual-add + norm fusion."""
-
     def __init__(self, hidden_size: int, eps: float = 1e-6,
                  use_triton: bool = True) -> None:
         super().__init__()
@@ -58,9 +54,6 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None
                 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Q/K head-norm inputs may be strided views. Keep the reference path
-        # for those; the model-width RMSNorm tensors are contiguous and use the
-        # fused kernels below.
         can_fuse = (self.use_triton and x.is_cuda and x.dtype == torch.float16
                     and x.is_contiguous() and x.shape[-1] == self.weight.numel())
         if can_fuse:

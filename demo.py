@@ -1,63 +1,65 @@
+import argparse
+import os
 import random
 import time
 
 import torch
 
 from microserve.Config import Config
+from microserve.distributed import destroy_distributed, is_rank_zero
 from microserve.engine.llm import LLMEngine
 from microserve.engine.sequence import SamplingParams
 
 
-NUM_REQUESTS = 1000
-INPUT_LEN = 128
-OUTPUT_LEN = 64
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tensor-parallel-size", type=int,
+                        default=int(os.environ.get("WORLD_SIZE", 1)))
+    parser.add_argument("--requests", type=int, default=1000)
+    parser.add_argument("--input-len", type=int, default=128)
+    parser.add_argument("--output-len", type=int, default=64)
+    parser.add_argument("--eager", action="store_true")
+    args = parser.parse_args()
 
-
-config = Config(
-    model_dir="~/huggingface/Qwen3-0.6B",
-    max_num_seqs=8,
-    max_num_batched_tokens=4096,
-    max_model_len=4096,
-    eos_token_id=None,
-    enforce_eager=False,
-)
-
-engine = LLMEngine(config)
-params = SamplingParams(temperature=0.0)
-
-rng = random.Random(0)
-vocab_size = engine.runner.vocab_size
-
-requests = []
-
-for _ in range(NUM_REQUESTS):
-    token_ids = [
-        rng.randrange(100, vocab_size)
-        for _ in range(INPUT_LEN)
-    ]
-
-    seq = engine.add(
-        token_ids,
-        sampling_params=params,
-        max_tokens=OUTPUT_LEN,
+    config = Config(
+        model_dir="~/huggingface/Qwen3-0.6B",
+        max_num_seqs=8,
+        max_num_batched_tokens=4096,
+        max_model_len=4096,
+        eos_token_id=None,
+        enforce_eager=args.eager,
+        tensor_parallel_size=args.tensor_parallel_size,
     )
-    requests.append(seq)
+    engine = LLMEngine(config)
+    params = SamplingParams(temperature=0.0)
+    rng = random.Random(0)
+    vocab_size = engine.runner.vocab_size
+    requests = []
+    for _ in range(args.requests):
+        token_ids = [rng.randrange(100, vocab_size) for _ in range(args.input_len)]
+        requests.append(engine.add(
+            token_ids, sampling_params=params, max_tokens=args.output_len))
 
-torch.cuda.synchronize()
-start = time.perf_counter()
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    while not engine.is_idle():
+        engine.step()
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
 
-while not engine.is_idle():
-    engine.step()
+    if is_rank_zero():
+        input_tokens = sum(seq.num_prompt_tokens for seq in requests)
+        output_tokens = sum(seq.num_completion_tokens for seq in requests)
+        print(f"requests: {args.requests}")
+        print(f"time: {elapsed:.3f} s")
+        print(f"requests/s: {args.requests / elapsed:.2f}")
+        print(f"input tokens/s: {input_tokens / elapsed:.2f}")
+        print(f"output tokens/s: {output_tokens / elapsed:.2f}")
+        print(f"total tokens/s: {(input_tokens + output_tokens) / elapsed:.2f}")
 
-torch.cuda.synchronize()
-elapsed = time.perf_counter() - start
 
-input_tokens = sum(seq.num_prompt_tokens for seq in requests)
-output_tokens = sum(seq.num_completion_tokens for seq in requests)
-
-print(f"requests: {NUM_REQUESTS}")
-print(f"time: {elapsed:.3f} s")
-print(f"requests/s: {NUM_REQUESTS / elapsed:.2f}")
-print(f"input tokens/s: {input_tokens / elapsed:.2f}")
-print(f"output tokens/s: {output_tokens / elapsed:.2f}")
-print(f"total tokens/s: {(input_tokens + output_tokens) / elapsed:.2f}")
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        destroy_distributed()

@@ -1,5 +1,3 @@
-"""Small qualitative greedy comparison; not a replacement for an eval dataset."""
-
 import json
 from pathlib import Path
 
