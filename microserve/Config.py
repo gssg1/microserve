@@ -21,6 +21,7 @@ class Config:
     quantization: str | None = None
     kv_cache_dtype: str = "fp16"
     scheduler_policy: str = "mixed"
+    enable_chunked_prefill: bool = False
     tensor_parallel_size: int = 1
     enable_metrics: bool = False
     enable_nvtx: bool = False

@@ -9,7 +9,8 @@ def make_scheduler(num_blocks, max_batched, max_num_seqs=8, eos=None):
     return Scheduler(num_kvcache_blocks=num_blocks, block_size=BS,
                      max_num_seqs=max_num_seqs,
                      max_num_batched_tokens=max_batched,
-                     eos_token_id=eos)
+                     eos_token_id=eos,
+                     enable_chunked_prefill=True)
 
 class FakeRunner:
     def __init__(self):

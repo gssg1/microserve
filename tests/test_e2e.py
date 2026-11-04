@@ -16,7 +16,8 @@ MAX_NEW = 12
 def run_prompts(prompts, chunk_budget):
     tok = AutoTokenizer.from_pretrained(MODEL)
     config = Config(model_dir=MODEL, enforce_eager=True,
-                    max_num_seqs=4, max_num_batched_tokens=chunk_budget)
+                    max_num_seqs=4, max_num_batched_tokens=chunk_budget,
+                    enable_chunked_prefill=True)
     config.eos_token_id = tok.eos_token_id
     eng = LLMEngine(config)
     hf = AutoModelForCausalLM.from_pretrained(

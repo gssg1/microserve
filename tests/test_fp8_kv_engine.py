@@ -13,7 +13,7 @@ def run(enforce_eager: bool):
         model_dir=MODEL, kv_cache_dtype="fp8_e4m3",
         enforce_eager=enforce_eager, max_num_seqs=4,
         max_num_batched_tokens=32, num_kvcache_blocks=16,
-        max_model_len=512))
+        max_model_len=512, enable_chunked_prefill=True))
     greedy = SamplingParams(temperature=0.0)
     first = engine.add(list(range(100, 108)), greedy, max_tokens=6)
     engine.step()

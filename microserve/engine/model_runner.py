@@ -234,6 +234,8 @@ class ModelRunner:
     def execute(self, seqs: list[Sequence]) -> list[int | None]:
         with cpu_profile("runner.partition_batch"):
             decode, prefill, chunk = self._partition_batch(seqs)
+        if chunk and not self.config.enable_chunked_prefill:
+            raise RuntimeError("chunk-prefill batch produced while chunked prefill is disabled")
         add_metric_value(
             "first_prefill_tokens",
             sum(seq.num_scheduled_tokens for _, seq in prefill),
@@ -280,19 +282,20 @@ class ModelRunner:
                 for index, token in zip(indices, sampled):
                     outputs[index] = token
 
-            for index, seq in chunk:
-                with cpu_profile("chunk_prefill.compile"):
-                    ctx, input_ids, positions = self._compile_chunk_prefill(seq)
-                set_context(ctx)
-                with profile_range("chunk_prefill.model", measure_cuda=True):
-                    hidden = self.model(input_ids, positions)
-                with profile_range("chunk_prefill.lm_head", measure_cuda=True):
-                    local_logits = self.model.compute_logits(hidden[-1:])
-                with profile_range(
-                        "chunk_prefill.logits_all_gather", measure_cuda=True):
-                    logits = self._gather_logits(local_logits)
-                outputs[index] = self._sample_rows(
-                    [seq], logits, [0], "chunk_prefill")[0]
+            if self.config.enable_chunked_prefill:
+                for index, seq in chunk:
+                    with cpu_profile("chunk_prefill.compile"):
+                        ctx, input_ids, positions = self._compile_chunk_prefill(seq)
+                    set_context(ctx)
+                    with profile_range("chunk_prefill.model", measure_cuda=True):
+                        hidden = self.model(input_ids, positions)
+                    with profile_range("chunk_prefill.lm_head", measure_cuda=True):
+                        local_logits = self.model.compute_logits(hidden[-1:])
+                    with profile_range(
+                            "chunk_prefill.logits_all_gather", measure_cuda=True):
+                        logits = self._gather_logits(local_logits)
+                    outputs[index] = self._sample_rows(
+                        [seq], logits, [0], "chunk_prefill")[0]
         finally:
             reset_context()
         return outputs

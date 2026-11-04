@@ -11,12 +11,14 @@ class Scheduler:
                  max_num_seqs: int = 64,
                  max_num_batched_tokens: int = 4096,
                  policy: str = "mixed",
-                 eos_token_id: int | None = None):
+                 eos_token_id: int | None = None,
+                 enable_chunked_prefill: bool = False):
         self.block_manager = BlockManager(num_kvcache_blocks, block_size)
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.eos_token_id = eos_token_id
         self.policy = policy
+        self.enable_chunked_prefill = enable_chunked_prefill
         assert policy in ("mixed", "prefill_first")
         self.last_batch_stats: dict | None = None
 
@@ -36,6 +38,8 @@ class Scheduler:
         if not self.waiting and not self.running:
             self.last_batch_stats = None
             return None
+        if not self.enable_chunked_prefill:
+            return self._schedule_without_chunked_prefill()
 
         scheduled: list[Sequence] = []
         scheduled_ids: set[int] = set()
@@ -92,6 +96,50 @@ class Scheduler:
                     scheduled_ids.add(seq.seq_id)
                 else:
                     break
+        return self._record_batch(scheduled)
+
+    def _schedule_without_chunked_prefill(self) -> list[Sequence] | None:
+        scheduled: list[Sequence] = []
+        budget = self.max_num_batched_tokens
+
+        while (self.waiting and budget > 0
+               and len(self.running) < self.max_num_seqs):
+            seq = self.waiting[0]
+            assert not seq.block_table and seq.num_computed_tokens == 0
+            if not self.block_manager.allocate(
+                    seq, budget, allow_partial=False):
+                break
+            if seq.num_scheduled_tokens == 0 and seq.gap == 1:
+                seq.num_scheduled_tokens = 1
+            assert (seq.num_computed_tokens + seq.num_scheduled_tokens
+                    == seq.num_tokens_with_spec)
+            self.waiting.popleft()
+            self.running.append(seq)
+            seq.status = SequenceStatus.RUNNING
+            if seq.first_scheduled_at is None:
+                seq.first_scheduled_at = perf_counter()
+            if seq.prefill_started_at is None:
+                seq.prefill_started_at = perf_counter()
+            seq.needs_sample = True
+            budget -= seq.num_scheduled_tokens
+            scheduled.append(seq)
+
+        if scheduled:
+            return self._record_batch(scheduled)
+
+        preempted: set[int] = set()
+        protected: set[int] = set()
+        for seq in list(self.running):
+            if budget <= 0:
+                break
+            if seq.gap != 1:
+                raise RuntimeError("partial prefill exists while chunked prefill is disabled")
+            if self._advance(seq, budget, preempted, protected):
+                budget -= seq.num_scheduled_tokens
+                scheduled.append(seq)
+                protected.add(seq.seq_id)
+            else:
+                break
         return self._record_batch(scheduled)
 
     def _record_batch(self, scheduled: list[Sequence]) -> list[Sequence] | None:

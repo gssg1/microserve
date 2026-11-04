@@ -48,6 +48,7 @@ def run(args, quantization, prompts):
     config = Config(model_dir=args.model, quantization=quantization,
                     kv_cache_dtype=args.kv_cache_dtype,
                     scheduler_policy=args.scheduler_policy,
+                    enable_chunked_prefill=args.chunked_prefill,
                     num_kvcache_blocks=args.num_kvcache_blocks,
                     max_num_seqs=args.max_num_seqs,
                     max_num_batched_tokens=args.max_num_batched_tokens,
@@ -233,6 +234,7 @@ def main():
                         help="Use the unfused PyTorch RMSNorm reference path")
     parser.add_argument("--scheduler-policy", choices=["mixed", "prefill_first"],
                         default="mixed")
+    parser.add_argument("--chunked-prefill", action="store_true")
     parser.add_argument("--kv-cache-dtype", choices=["fp16", "fp8_e4m3"],
                         default="fp16")
     parser.add_argument("--reverse-order", action="store_true",

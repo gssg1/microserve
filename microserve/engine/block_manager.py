@@ -79,7 +79,17 @@ class BlockManager:
                 break
         return block_table
 
-    def allocate(self,seq: Sequence,token_budget: int) -> bool:
+    def _rollback_cached_blocks(self, seq: Sequence, block_table: list[int]):
+        self.total_prefix_cache_hit_tokens -= len(block_table) * self.block_size
+        for block_id in block_table:
+            self.blocks[block_id].ref_count -= 1
+            if self.blocks[block_id].ref_count == 0:
+                self.deallocate_block(block_id)
+        del seq.block_table[:len(block_table)]
+        seq.num_computed_tokens -= len(block_table) * self.block_size
+
+    def allocate(self,seq: Sequence,token_budget: int,
+                 allow_partial: bool = True) -> bool:
         if (seq.gap == 1):
             if (seq.num_computed_tokens % self.block_size != 0):
                 return True
@@ -102,15 +112,13 @@ class BlockManager:
                         self.used_blocks.add(block_id)
                         self.free_blocks.remove(block_id)
 
-                num_scheduled_tokens = min(self.free_blocks_nums * self.block_size,token_budget,seq.gap)
+                capacity = self.free_blocks_nums * self.block_size
+                if not allow_partial and (seq.gap > token_budget or seq.gap > capacity):
+                    self._rollback_cached_blocks(seq, block_table)
+                    return False
+                num_scheduled_tokens = min(capacity,token_budget,seq.gap)
                 if (num_scheduled_tokens == 0 and seq.gap > 0):
-                    self.total_prefix_cache_hit_tokens -= len(block_table) * self.block_size
-                    for block_id in block_table:
-                        self.blocks[block_id].ref_count -= 1
-                        if self.blocks[block_id].ref_count == 0:
-                            self.deallocate_block(block_id)
-                    del seq.block_table[:len(block_table)]
-                    seq.num_computed_tokens -= len(block_table) * self.block_size
+                    self._rollback_cached_blocks(seq, block_table)
                     return False
                 seq.num_scheduled_tokens = num_scheduled_tokens
 
@@ -120,7 +128,10 @@ class BlockManager:
             else:
                 last_used = seq.num_computed_tokens % self.block_size
                 last_free = 0 if last_used == 0 else self.block_size - last_used
-                num_scheduled_tokens = min(self.free_blocks_nums * self.block_size + last_free,
+                capacity = self.free_blocks_nums * self.block_size + last_free
+                if not allow_partial and (seq.gap > token_budget or seq.gap > capacity):
+                    return False
+                num_scheduled_tokens = min(capacity,
                                            token_budget, seq.gap)
                 seq.num_scheduled_tokens = num_scheduled_tokens
 

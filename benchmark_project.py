@@ -143,6 +143,7 @@ def make_engine(args, *, policy="mixed", eager=False, fused=True,
         max_model_len=2048,
         num_kvcache_blocks=64,
         scheduler_policy=policy,
+        enable_chunked_prefill=args.chunked_prefill,
         enforce_eager=eager,
         fused_rmsnorm=fused,
         kv_cache_dtype=kv_dtype,
@@ -246,6 +247,8 @@ def main():
                         default=int(os.environ.get("WORLD_SIZE", 1)))
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--output", default="project_benchmark.json")
+    parser.add_argument("--chunked-prefill",
+                        action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--section",
         choices=("all", "baseline", "unfused", "eager", "prefill_first",

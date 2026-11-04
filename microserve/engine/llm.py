@@ -28,11 +28,20 @@ class LLMEngine:
             max_num_seqs=config.max_num_seqs,
             max_num_batched_tokens=config.max_num_batched_tokens,
             policy=config.scheduler_policy,
-            eos_token_id=config.eos_token_id)
+            eos_token_id=config.eos_token_id,
+            enable_chunked_prefill=config.enable_chunked_prefill)
 
     def add(self, token_ids: list[int],
             sampling_params: SamplingParams | None = None,
             max_tokens: int = 128) -> Sequence:
+        if (not self.config.enable_chunked_prefill
+                and len(token_ids) > self.config.max_num_batched_tokens):
+            raise ValueError(
+                "prompt length exceeds max_num_batched_tokens while chunked prefill is disabled")
+        if (not self.config.enable_chunked_prefill
+                and len(token_ids) > self.runner.num_blocks * self.config.block_size):
+            raise ValueError(
+                "prompt length exceeds KV cache capacity while chunked prefill is disabled")
         seq = Sequence(token_ids, sampling_params=sampling_params,
                        max_tokens=max_tokens)
         self.scheduler.add(seq)
