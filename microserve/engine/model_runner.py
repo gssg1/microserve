@@ -220,6 +220,12 @@ class ModelRunner:
                 chunk.append(item)
         return decode, prefill, chunk
 
+    @staticmethod
+    def _is_partial_prefill(seq: Sequence) -> bool:
+        return (seq.gap > 1
+                and seq.num_computed_tokens + seq.num_scheduled_tokens
+                < seq.num_tokens_with_spec)
+
     def _make_block_tables(self, seqs: list[Sequence]) -> torch.Tensor:
         max_len = max(len(s.block_table) for s in seqs)
         bt = torch.full((len(seqs), max_len), -1, dtype=torch.int32, device=self.device)
@@ -234,8 +240,9 @@ class ModelRunner:
     def execute(self, seqs: list[Sequence]) -> list[int | None]:
         with cpu_profile("runner.partition_batch"):
             decode, prefill, chunk = self._partition_batch(seqs)
-        if chunk and not self.config.enable_chunked_prefill:
-            raise RuntimeError("chunk-prefill batch produced while chunked prefill is disabled")
+        if (not self.config.enable_chunked_prefill
+                and any(self._is_partial_prefill(seq) for seq in seqs)):
+            raise RuntimeError("partial prefill batch produced while chunked prefill is disabled")
         add_metric_value(
             "first_prefill_tokens",
             sum(seq.num_scheduled_tokens for _, seq in prefill),
@@ -282,7 +289,7 @@ class ModelRunner:
                 for index, token in zip(indices, sampled):
                     outputs[index] = token
 
-            if self.config.enable_chunked_prefill:
+            if chunk:
                 for index, seq in chunk:
                     with cpu_profile("chunk_prefill.compile"):
                         ctx, input_ids, positions = self._compile_chunk_prefill(seq)

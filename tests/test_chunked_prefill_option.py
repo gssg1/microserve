@@ -1,4 +1,5 @@
 from microserve.engine.scheduler import Scheduler
+from microserve.engine.model_runner import ModelRunner
 from microserve.engine.sequence import Sequence
 
 
@@ -61,3 +62,33 @@ def test_disabled_accepts_single_token_prompt():
     assert batch == [seq]
     assert seq.num_scheduled_tokens == 1
     assert seq.needs_sample
+
+
+def test_disabled_allows_complete_remainder_after_prefix_cache_hit():
+    scheduler = make_scheduler(False)
+    first = Sequence(list(range(8)), max_tokens=2)
+    scheduler.add(first)
+
+    batch = scheduler.schedule()
+    scheduler.postprocess(batch, [100])
+
+    second = Sequence(list(range(8)), max_tokens=2)
+    scheduler.add(second)
+    batch = scheduler.schedule()
+
+    assert batch == [second]
+    assert second.num_computed_tokens == 4
+    assert second.num_scheduled_tokens == 4
+    assert not ModelRunner._is_partial_prefill(second)
+
+
+def test_partial_prefill_detection_distinguishes_incomplete_work():
+    seq = Sequence(list(range(10)), max_tokens=2)
+    seq.num_scheduled_tokens = 6
+
+    assert ModelRunner._is_partial_prefill(seq)
+
+    seq.num_computed_tokens = 4
+    seq.num_scheduled_tokens = 6
+
+    assert not ModelRunner._is_partial_prefill(seq)
