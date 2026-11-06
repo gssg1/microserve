@@ -97,6 +97,8 @@ def run(args, quantization, prompts):
                 worker_name=f"rank_{get_global_rank()}"),
             record_shapes=True,
         )
+    if args.profile == "nvtx":
+        torch.cuda.profiler.start()
     torch.cuda.nvtx.range_push("microserve_measured_" + (quantization or "fp16"))
     started = time.perf_counter()
     with profiler_context as profiler:
@@ -118,6 +120,8 @@ def run(args, quantization, prompts):
     torch.cuda.synchronize()
     ended = time.perf_counter()
     torch.cuda.nvtx.range_pop()
+    if args.profile == "nvtx":
+        torch.cuda.profiler.stop()
     gpu_state_after = gpu_state()
     profiling = engine.metrics_snapshot(gather=True)
 
